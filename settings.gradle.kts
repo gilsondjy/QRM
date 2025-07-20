@@ -1,23 +1,20 @@
 pluginManagement {
     repositories {
-        google {
-            content {
-                includeGroupByRegex("com\\.android.*")
-                includeGroupByRegex("com\\.google.*")
-                includeGroupByRegex("androidx.*")
-            }
-        }
-        mavenCentral()
         gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+    plugins {
+        id("com.android.application")       version "8.7.3"
+        id("org.jetbrains.kotlin.android") version "1.9.10"
+        id("com.google.gms.google-services") version "4.3.15"
     }
 }
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
     }
 }
-
 rootProject.name = "QRM"
 include(":app")
