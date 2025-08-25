@@ -48,12 +48,16 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // Scanner QR
+    // QR Scanner existant
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.3.0")
 
     // Firestore
     implementation("com.google.firebase:firebase-firestore-ktx:24.7.1")
+    //implementation(libs.firebase.storage.ktx)
+    implementation ("com.google.firebase:firebase-storage-ktx:20.3.0")
+    //implementation(libs.firebase.storage)
+    implementation("io.coil-kt:coil-compose:2.0.0")
 
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
