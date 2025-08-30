@@ -30,19 +30,23 @@ import androidx.lifecycle.lifecycleScope
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.storage.FirebaseStorage
-import com.google.firebase.storage.StorageException
 import com.google.firebase.storage.StorageMetadata
 import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanIntentResult
 import com.journeyapps.barcodescanner.ScanOptions
 import com.tuduticket.qrm.ui.theme.QRMTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.tasks.await
 import java.io.BufferedReader
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -51,6 +55,14 @@ import java.util.UUID
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
 
+    // ====== Deep link custom (QR opaque) ======
+    private companion object {
+        private const val CUSTOM_SCHEME_PREFIX = "qrm://t/"
+        private fun newToken(): String =
+            UUID.randomUUID().toString().replace("-", "").take(24)
+        private fun buildDeepLink(token: String) = "$CUSTOM_SCHEME_PREFIX$token"
+    }
+
     // Firebase
     private lateinit var db: FirebaseFirestore
     private lateinit var storage: FirebaseStorage
@@ -58,7 +70,7 @@ class MainActivity : ComponentActivity() {
     // Navigation
     private var currentPage by mutableStateOf(Page.Scan)
 
-    // Scan/Contrôle/Import (inchangés)
+    // Scan / Contrôle / Import
     private var scannedCode by mutableStateOf<String?>(null)
     private var canSaveScan by mutableStateOf(false)
     private var controlRef by mutableStateOf<String?>(null)
@@ -66,12 +78,13 @@ class MainActivity : ComponentActivity() {
     private var controlCount by mutableStateOf<Int?>(null)
     private var importMessage by mutableStateOf<String?>(null)
 
-    // --- Nouvel état: progression de GÉNÉRATION ---
+    // Progression Génération
     private var isGenerating by mutableStateOf(false)
     private var genProcessed by mutableStateOf(0)
     private var genTotal by mutableStateOf(0)
-    private var genProgress by mutableStateOf(0f) // 0..1
+    private var genProgress by mutableStateOf(0f)
 
+    // Launchers
     private val scanLauncher = registerForActivityResult(ScanContract()) { result: ScanIntentResult ->
         try {
             result.contents?.let { scannedCode = it; canSaveScan = true }
@@ -82,9 +95,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private val controlLauncher = registerForActivityResult(ScanContract()) { result: ScanIntentResult ->
-        try { result.contents?.let { checkTicketByCode(it) } ?: run {
-            controlMessage = "Scan annulé"; playTone(false)
-        } } catch (e: Exception) {
+        try {
+            val raw = result.contents
+            if (raw.isNullOrBlank()) {
+                controlMessage = "Scan annulé"; playTone(false)
+            } else {
+                checkTicketByCode(raw)
+            }
+        } catch (e: Exception) {
             controlMessage = "Erreur: ${e.message}"; playTone(false)
         }
     }
@@ -119,9 +137,10 @@ class MainActivity : ComponentActivity() {
                                 titleContentColor = MaterialTheme.colorScheme.onSecondary
                             ),
                             actions = {
-                                TextButton({ currentPage = Page.Scan }) { Text("Scanner") }
+                               // TextButton({ currentPage = Page.Scan }) { Text("Scanner") }
                                 TextButton({ currentPage = Page.Generate }) { Text("Générer") }
                                 TextButton({ currentPage = Page.Control }) { Text("Contrôler") }
+                               // TextButton({ currentPage = Page.Import }) { Text("Importer") }
                                 TextButton({ currentPage = Page.Visualise }) { Text("Visualiser") }
                             }
                         )
@@ -135,7 +154,6 @@ class MainActivity : ComponentActivity() {
                                 onSave = { code -> saveScan(code) }
                             )
                             Page.Generate -> GenerateScreen { data, saveToCloud ->
-                                // Lance la génération
                                 generateTickets(data, saveToCloud)
                             }
                             Page.Control -> ControlScreen(
@@ -149,7 +167,6 @@ class MainActivity : ComponentActivity() {
                             Page.Visualise -> VisualiseScreen(storage)
                         }
 
-                        // --- Overlay de progression pendant la GÉNÉRATION ---
                         if (isGenerating) {
                             Box(
                                 Modifier.fillMaxSize().background(ComposeColor.Black.copy(alpha = 0.35f)),
@@ -176,7 +193,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // --- Fonctions existantes (scan/contrôle/import) inchangées ---
+    // ====== Utilitaires ======
+    private fun playTone(success: Boolean) {
+        try {
+            ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+                .startTone(if (success) ToneGenerator.TONE_PROP_BEEP else ToneGenerator.TONE_PROP_NACK, 200)
+        } catch (_: Exception) {}
+    }
 
     private fun saveScan(code: String) {
         db.collection("scannedCodes")
@@ -186,178 +209,261 @@ class MainActivity : ComponentActivity() {
         scannedCode = null; canSaveScan = false
     }
 
-    private fun playTone(success: Boolean) {
-        try {
-            ToneGenerator(AudioManager.STREAM_MUSIC, 100)
-                .startTone(if (success) ToneGenerator.TONE_PROP_BEEP else ToneGenerator.TONE_PROP_NACK, 200)
-        } catch (_: Exception) {}
-    }
-
+    // ====== Contrôle : n'accepte que nos QR qrm://t/<token> ======
     private fun checkTicketByCode(raw: String) {
+        if (!raw.startsWith(CUSTOM_SCHEME_PREFIX)) {
+            controlRef = null; controlCount = null
+            controlMessage = "QR inconnu : ce ticket nécessite l'application officielle."
+            playTone(false)
+            return
+        }
         db.collection("generatedEvents").whereEqualTo("code", raw).get()
             .addOnSuccessListener { snap ->
                 if (snap.isEmpty) {
-                    controlRef = null; controlCount = null; controlMessage = "Non valide / Ticket inconnu"; playTone(false)
+                    controlRef = null; controlCount = null
+                    controlMessage = "Non valide / Ticket inconnu"
+                    playTone(false)
                 } else {
                     val doc = snap.documents.first()
                     val ref = doc.getString("ref")
                     val existing = doc.getLong("nbControle")?.toInt() ?: 0
                     val newCount = existing + 1
-                    doc.reference.set(mapOf("nbControle" to newCount, "status" to "OK"), SetOptions.merge())
+                    doc.reference.set(
+                        mapOf("nbControle" to newCount, "status" to "OK"),
+                        SetOptions.merge()
+                    )
                     controlRef = ref; controlCount = newCount
                     controlMessage = if (existing == 0) "Validé" else "Déjà contrôlé ($existing fois)"
                     playTone(true)
                 }
-            }.addOnFailureListener { e ->
-                controlMessage = "Erreur: ${e.localizedMessage}"; playTone(false)
+            }
+            .addOnFailureListener { e ->
+                controlMessage = "Erreur: ${e.localizedMessage}"
+                playTone(false)
             }
     }
 
+    // ====== Import CSV (séquentiel & mémoire-safe) ======
     private fun importCsv(uri: Uri) {
-        // (inchangé – si tu veux aussi la progression ici, dis-moi)
-        try {
-            contentResolver.openInputStream(uri)?.use { stream ->
-                val reader = BufferedReader(InputStreamReader(stream))
-                reader.readLine()
-                var ticketNumber = 1
-                var count = 0
-                val qrSize = 300
-                val textHeight = 50
-                val totalHeight = qrSize + textHeight
-                val writer = QRCodeWriter()
-                val dateFormat = SimpleDateFormat("yyyy-MM-dd")
-                val generationDate = dateFormat.format(Calendar.getInstance().time)
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                contentResolver.openInputStream(uri)?.use { stream ->
+                    val reader = BufferedReader(InputStreamReader(stream))
+                    reader.readLine() // header
+                    var ticketNumber = 1
+                    var count = 0
 
-                reader.lineSequence().filter { it.isNotBlank() }.forEach { line ->
-                    val c = line.split(';'); if (c.size < 6) return@forEach
-                    val ref = c[0].trim(); val name = c[1].trim()
-                    val date = c[2].trim(); val start = c[3].trim()
-                    val end = c[4].trim(); val place = c[5].trim()
+                    val qrSize = 300
+                    val textHeight = 24
+                    val totalHeight = qrSize + textHeight
+                    val writer = QRCodeWriter()
+                    val hints = mapOf(EncodeHintType.MARGIN to 1) // quiet-zone réduite
+                    val dateFormat = SimpleDateFormat("yyyy-MM-dd")
+                    val generationDate = dateFormat.format(Calendar.getInstance().time)
 
-                    val payload = "Name: $name  Date: $date  Time: $start - $end  Place: $place  Ref.:$ref"
-                    db.collection("generatedEvents").add(
-                        mapOf("code" to payload, "ref" to ref, "name" to name, "date" to date,
-                            "start" to start, "end" to end, "place" to place,
-                            "timestamp" to System.currentTimeMillis(), "no" to ticketNumber)
-                    )
+                    reader.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+                        val c = line.split(';')
+                        if (c.size >= 6) {
+                            val ref = c[0].trim()
+                            val name = c[1].trim()
+                            val date = c[2].trim()
+                            val start = c[3].trim()
+                            val end = c[4].trim()
+                            val place = c[5].trim()
 
-                    val matrix = writer.encode(payload, BarcodeFormat.QR_CODE, qrSize, qrSize)
-                    val bmp = Bitmap.createBitmap(qrSize, totalHeight, Bitmap.Config.RGB_565)
-                    val canvas = Canvas(bmp)
-                    val paint = Paint().apply { color = Color.parseColor("#1E90FF"); textSize = 20f; textAlign = Paint.Align.CENTER }
-                    canvas.drawColor(Color.WHITE)
-                    for (x in 0 until qrSize) for (y in 0 until qrSize)
-                        bmp.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
-                    canvas.drawText("Ref.:$ref, No: $ticketNumber", qrSize / 2f, (qrSize + 30f), paint)
+                            val token = newToken()
+                            val payload = buildDeepLink(token)
 
-                    val fn = "imported_${ref}.png"
-                    val vals = ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, fn)
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/QRM/$generationDate")
-                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                            // 1) Firestore
+                            db.collection("generatedEvents").add(
+                                mapOf(
+                                    "code" to payload,
+                                    "token" to token,
+                                    "ref" to ref,
+                                    "name" to name,
+                                    "date" to date,
+                                    "start" to start,
+                                    "end" to end,
+                                    "place" to place,
+                                    "status" to "valid",
+                                    "timestamp" to System.currentTimeMillis(),
+                                    "no" to ticketNumber
+                                )
+                            ).await()
+
+                            // 2) Générer le bitmap (quiet-zone fine)
+                            val matrix = writer.encode(payload, BarcodeFormat.QR_CODE, qrSize, qrSize, hints)
+                            var bmp: Bitmap? = Bitmap.createBitmap(qrSize, totalHeight, Bitmap.Config.RGB_565)
+                            val canvas = Canvas(bmp!!)
+                            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                color = Color.BLACK
+                                textSize = 18f
+                                textAlign = Paint.Align.CENTER
+                            }
+                            canvas.drawColor(Color.WHITE)
+                            for (x in 0 until qrSize) for (y in 0 until qrSize)
+                                bmp!!.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
+                            canvas.drawText("Ref.:$ref, No: $ticketNumber", qrSize / 2f, (qrSize + 16f), paint)
+
+                            val fn = "imported_${ref}.png"
+
+                            // 3) Galerie
+                            withContext(Dispatchers.Main) {
+                                val vals = ContentValues().apply {
+                                    put(MediaStore.Images.Media.DISPLAY_NAME, fn)
+                                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/QRM/$generationDate")
+                                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                                }
+                                contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, vals)?.also { outUri ->
+                                    contentResolver.openOutputStream(outUri)?.use { out ->
+                                        bmp!!.compress(Bitmap.CompressFormat.PNG, 100, out)
+                                    }
+                                    vals.clear(); vals.put(MediaStore.Images.Media.IS_PENDING, 0)
+                                    contentResolver.update(outUri, vals, null, null)
+                                }
+                            }
+
+                            // 4) Upload Storage via fichier temp
+                            val temp = File.createTempFile("qr_", ".png", cacheDir)
+                            FileOutputStream(temp).use { out ->
+                                bmp!!.compress(Bitmap.CompressFormat.PNG, 100, out)
+                            }
+                            val storageRef = storage.reference.child("qrcodes/$generationDate/$fn")
+                            val metadata = StorageMetadata.Builder()
+                                .setContentType("image/png")
+                                .setCustomMetadata("no", ticketNumber.toString())
+                                .setCustomMetadata("ref", ref)
+                                .build()
+                            storageRef.putFile(Uri.fromFile(temp), metadata).await()
+                            temp.delete()
+
+                            // 5) Libère mémoire
+                            bmp!!.recycle()
+                            bmp = null
+
+                            count++; ticketNumber++
+                            withContext(Dispatchers.Main) { importMessage = "Import: $count" }
+                            if (count % 50 == 0) { yield(); delay(5) }
+                        }
                     }
-                    contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, vals)?.also { outUri ->
-                        contentResolver.openOutputStream(outUri)?.use { out -> bmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
-                        vals.clear(); vals.put(MediaStore.Images.Media.IS_PENDING, 0)
-                        contentResolver.update(outUri, vals, null, null)
+                    withContext(Dispatchers.Main) {
+                        importMessage = "Import terminé : $count tickets ajoutés"
                     }
-
-                    try {
-                        val storageRef = storage.reference.child("qrcodes/$generationDate/$fn")
-                        val baos = ByteArrayOutputStream()
-                        bmp.compress(Bitmap.CompressFormat.PNG, 100, baos)
-                        val data = baos.toByteArray()
-                        val metadata = StorageMetadata.Builder()
-                            .setContentType("image/png")
-                            .setCustomMetadata("no", ticketNumber.toString())
-                            .setCustomMetadata("ref", ref).build()
-                        storageRef.putBytes(data, metadata)
-                            .addOnFailureListener { e -> if (e is StorageException) Toast.makeText(this, "Upload (CSV) échoué: ${e.message}", Toast.LENGTH_LONG).show() }
-                    } catch (_: Exception) {}
-                    count++; ticketNumber++
+                } ?: run {
+                    withContext(Dispatchers.Main) { importMessage = "Erreur lecture fichier" }
                 }
-                importMessage = "Import terminé : $count tickets ajoutés"
-            } ?: run { importMessage = "Erreur lecture fichier" }
-        } catch (e: Exception) { importMessage = "Erreur: ${e.message}" }
+            } catch (e: OutOfMemoryError) {
+                withContext(Dispatchers.Main) { importMessage = "Mémoire insuffisante : ${e.message}" }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { importMessage = "Erreur: ${e.message}" }
+            }
+        }
     }
 
-    /** GÉNÉRATION AVEC PROGRESSION & THREAD IO */
+    // ====== Génération (2000+ robuste, quiet-zone fine) ======
     private fun generateTickets(form: EventData, saveToCloud: Boolean) {
         val writer = QRCodeWriter()
+        val hints = mapOf(EncodeHintType.MARGIN to 1) // quiet-zone réduite
         val qrSize = 300
-        val textHeight = 50
+        val textHeight = 24
         val totalHeight = qrSize + textHeight
         val dateFormat = SimpleDateFormat("yyyy-MM-dd")
         val generationDate = dateFormat.format(Calendar.getInstance().time)
 
-        // init état UI
         isGenerating = true; genProcessed = 0; genTotal = form.quantity; genProgress = 0f
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 var ticketNumber = 1
+
                 repeat(form.quantity) {
                     val ref = UUID.randomUUID().toString().takeLast(8)
-                    val payload = "Name: ${form.name}  Date: ${form.date}  Time: ${form.start} - ${form.end}  Place: ${form.place}  Ref.:$ref"
+                    val token = newToken()
+                    val payload = buildDeepLink(token)
 
-                    // Firestore (info + n°)
+                    // 1) Firestore
                     db.collection("generatedEvents").add(
-                        mapOf("code" to payload, "ref" to ref, "name" to form.name, "date" to form.date,
-                            "start" to form.start, "end" to form.end, "place" to form.place,
-                            "timestamp" to System.currentTimeMillis(), "no" to ticketNumber)
-                    )
+                        mapOf(
+                            "code" to payload,
+                            "token" to token,
+                            "ref" to ref,
+                            "name" to form.name,
+                            "date" to form.date,
+                            "start" to form.start,
+                            "end" to form.end,
+                            "place" to form.place,
+                            "status" to "valid",
+                            "timestamp" to System.currentTimeMillis(),
+                            "no" to ticketNumber
+                        )
+                    ).await()
 
-                    // Image QR + footer
-                    val matrix = writer.encode(payload, BarcodeFormat.QR_CODE, qrSize, qrSize)
-                    val bmp = Bitmap.createBitmap(qrSize, totalHeight, Bitmap.Config.RGB_565)
-                    val canvas = Canvas(bmp)
-                    val paint = Paint().apply { color = Color.parseColor("#1E90FF"); textSize = 20f; textAlign = Paint.Align.CENTER }
+                    // 2) Générer le bitmap (quiet-zone fine)
+                    val matrix = writer.encode(payload, BarcodeFormat.QR_CODE, qrSize, qrSize, hints)
+                    var bmp: Bitmap? = Bitmap.createBitmap(qrSize, totalHeight, Bitmap.Config.RGB_565)
+                    val canvas = Canvas(bmp!!)
+                    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.BLACK
+                        textSize = 18f
+                        textAlign = Paint.Align.CENTER
+                    }
                     canvas.drawColor(Color.WHITE)
                     for (x in 0 until qrSize) for (y in 0 until qrSize)
-                        bmp.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
-                    canvas.drawText("Ref.:$ref, No: $ticketNumber", qrSize / 2f, (qrSize + 30f), paint)
+                        bmp!!.setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
+                    canvas.drawText("Ref.:$ref, No: $ticketNumber", qrSize / 2f, (qrSize + 16f), paint)
 
                     val fn = "ticket_$ref.png"
 
                     if (saveToCloud) {
-                        try {
-                            val storageRef = storage.reference.child("qrcodes/$generationDate/$fn")
-                            val baos = ByteArrayOutputStream()
-                            bmp.compress(Bitmap.CompressFormat.PNG, 100, baos)
-                            val data = baos.toByteArray()
-                            val metadata = StorageMetadata.Builder()
-                                .setContentType("image/png")
-                                .setCustomMetadata("no", ticketNumber.toString())
-                                .setCustomMetadata("ref", ref).build()
-                            storageRef.putBytes(data, metadata)
-                        } catch (_: Exception) { /* on continue */ }
-                    } else {
-                        val vals = ContentValues().apply {
-                            put(MediaStore.Images.Media.DISPLAY_NAME, fn)
-                            put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/QRM/$generationDate")
-                            put(MediaStore.Images.Media.IS_PENDING, 1)
+                        val temp = File.createTempFile("qr_", ".png", cacheDir)
+                        FileOutputStream(temp).use { out ->
+                            bmp!!.compress(Bitmap.CompressFormat.PNG, 100, out)
                         }
-                        contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, vals)?.also { uriOut ->
-                            contentResolver.openOutputStream(uriOut)?.use { out -> bmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
-                            vals.clear(); vals.put(MediaStore.Images.Media.IS_PENDING, 0)
-                            contentResolver.update(uriOut, vals, null, null)
+                        val storageRef = storage.reference.child("qrcodes/$generationDate/$fn")
+                        val metadata = StorageMetadata.Builder()
+                            .setContentType("image/png")
+                            .setCustomMetadata("no", ticketNumber.toString())
+                            .setCustomMetadata("ref", ref)
+                            .build()
+                        storageRef.putFile(Uri.fromFile(temp), metadata).await()
+                        temp.delete()
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            val vals = ContentValues().apply {
+                                put(MediaStore.Images.Media.DISPLAY_NAME, fn)
+                                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/QRM/$generationDate")
+                                put(MediaStore.Images.Media.IS_PENDING, 1)
+                            }
+                            contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, vals)?.also { uriOut ->
+                                contentResolver.openOutputStream(uriOut)?.use { out ->
+                                    bmp!!.compress(Bitmap.CompressFormat.PNG, 100, out)
+                                }
+                                vals.clear(); vals.put(MediaStore.Images.Media.IS_PENDING, 0)
+                                contentResolver.update(uriOut, vals, null, null)
+                            }
                         }
                     }
 
-                    // mise à jour progression UI
+                    // 3) Libère mémoire + progress
+                    bmp!!.recycle(); bmp = null
                     withContext(Dispatchers.Main) {
                         genProcessed++
                         genProgress = if (genTotal > 0) genProcessed.toFloat() / genTotal else 0f
                     }
-
+                    if (ticketNumber % 50 == 0) { yield(); delay(5) }
                     ticketNumber++
                 }
 
                 withContext(Dispatchers.Main) {
                     isGenerating = false
                     Toast.makeText(this@MainActivity, "Créé ${form.quantity} tickets", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: OutOfMemoryError) {
+                withContext(Dispatchers.Main) {
+                    isGenerating = false
+                    Toast.makeText(this@MainActivity, "Mémoire insuffisante : ${e.message}", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
