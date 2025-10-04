@@ -54,6 +54,9 @@ fun VisualiseScreen(storage: FirebaseStorage) {
     var isExporting by remember { mutableStateOf(false) }
     var exportProgress by remember { mutableStateOf(0f) }
 
+    // ⚙️ Nouvelle option: 1 QR par page ?
+    var singlePerPage by remember { mutableStateOf(false) }
+
     // Charger les dossiers (dates)
     LaunchedEffect(Unit) {
         try {
@@ -70,7 +73,7 @@ fun VisualiseScreen(storage: FirebaseStorage) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
             horizontalAlignment = Alignment.Start
         ) {
-            item { Text("Dossiers disponibles (dates) :") }
+            item { Text("Dossiês disponíveis (datas):") }
 
             items(folders) { folder ->
                 Card(
@@ -125,6 +128,27 @@ fun VisualiseScreen(storage: FirebaseStorage) {
                     }
                 }
 
+                // 👉 Choix du mode d’export
+                item {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 8.dp)
+                    ) {
+                        RadioButton(
+                            selected = !singlePerPage,
+                            onClick = { singlePerPage = false }
+                        )
+                        Text("Plusieurs par page")
+                        Spacer(Modifier.width(20.dp))
+                        RadioButton(
+                            selected = singlePerPage,
+                            onClick = { singlePerPage = true }
+                        )
+                        Text("1 QR par page")
+                    }
+                }
+
+                // Bouton d’export
                 item {
                     Spacer(Modifier.height(8.dp))
                     Button(
@@ -139,12 +163,14 @@ fun VisualiseScreen(storage: FirebaseStorage) {
                                     context = context,
                                     folder = selectedFolder!!,
                                     items = sorted,
-                                    qrSizeMm = 16f,        // ↑ QR un peu plus grand
+                                    // ⚠️ On laisse VOS tailles actuelles (ne pas changer)
+                                    qrSizeMm = 16f,
                                     marginMm = 5f,
                                     gutterMm = 2f,
-                                    labelScale = 0.095f,   // texte légèrement plus petit
-                                    labelTopPadMm = 0f,    // pas d’espace au-dessus
-                                    labelNudgeUpMm = 0.1f  // remonte le texte (~0.4–0.8 mm)
+                                    labelScale = 0.095f,
+                                    labelTopPadMm = 0f,
+                                    labelNudgeUpMm = 0.1f,
+                                    singlePerPage = singlePerPage     // ← NOUVEAU
                                 ) { done, total ->
                                     exportProgress = if (total > 0) done.toFloat() / total else 0f
                                 }
@@ -201,8 +227,8 @@ private fun extractRefFromName(name: String): String? {
 
 /* ================================================================
    EXPORT PDF — Respecte l’aspect (pas d’étirement) et recolore
-   SEULEMENT la bande texte (sous le QR). On peut aussi remonter
-   la ligne via labelNudgeUpMm pour la coller au QR.
+   SEULEMENT la bande texte (sous le QR). On peut remonter la ligne
+   via labelNudgeUpMm. Supporte maintenant 1 QR par page OU grille.
    ================================================================ */
 private suspend fun exportToPdf_RepaintFooterStrict(
     context: Context,
@@ -214,6 +240,7 @@ private suspend fun exportToPdf_RepaintFooterStrict(
     labelScale: Float = 0.10f,   // proportion de la largeur pour la taille du texte
     labelTopPadMm: Float = 0.3f, // espace entre QR et début du texte (mm)
     labelNudgeUpMm: Float = 0f,  // remonte la ligne (mm) pour coller davantage
+    singlePerPage: Boolean = false, // ← NOUVEAU : 1 QR par page
     onProgress: (processed: Int, total: Int) -> Unit
 ) {
     if (items.isEmpty()) {
@@ -230,7 +257,7 @@ private suspend fun exportToPdf_RepaintFooterStrict(
     val gutterPx = mmToPx(gutterMm).coerceAtLeast(0)
     val imgWidthPx = max(mmToPx(qrSizeMm), 48)
 
-    // 1) Ratio H/L à partir d’un échantillon (évite la déformation)
+    // 1) Ratio H/L (évite la déformation)
     val sampleUrl = items.firstOrNull()?.url
     val sampleRatio: Float = withContext(Dispatchers.IO) {
         try {
@@ -248,8 +275,13 @@ private suspend fun exportToPdf_RepaintFooterStrict(
     val cellH = imgHeightPx
     val availW = pageWidth - marginPx * 2
     val availH = pageHeight - marginPx * 2
-    val columns = max(1, floor((availW + gutterPx).toFloat() / (cellW + gutterPx)).toInt())
-    val rows = max(1, floor((availH + gutterPx).toFloat() / (cellH + gutterPx)).toInt())
+
+    val columns = if (singlePerPage) 1
+    else max(1, floor((availW + gutterPx).toFloat() / (cellW + gutterPx)).toInt())
+
+    val rows = if (singlePerPage) 1
+    else max(1, floor((availH + gutterPx).toFloat() / (cellH + gutterPx)).toInt())
+
     val perPage = columns * rows
 
     val pdf = PdfDocument()
@@ -282,8 +314,17 @@ private suspend fun exportToPdf_RepaintFooterStrict(
 
             val row = indexOnPage / columns
             val col = indexOnPage % columns
-            val left = marginPx + col * (cellW + gutterPx)
-            val top  = marginPx + row * (cellH + gutterPx)
+
+            // Positionnement : centre si 1 par page
+            val left = if (singlePerPage)
+                ((pageWidth - cellW) / 2)
+            else
+                marginPx + col * (cellW + gutterPx)
+
+            val top = if (singlePerPage)
+                max(marginPx, (pageHeight - cellH) / 2)
+            else
+                marginPx + row * (cellH + gutterPx)
 
             val dest = Rect(left, top, left + cellW, top + cellH)
             page.canvas.drawBitmap(bmp, null, dest, null)
@@ -311,7 +352,6 @@ private suspend fun exportToPdf_RepaintFooterStrict(
                 }
                 paintText.getFontMetrics(fm)
 
-                // Collé : on supprime le +1f et on remonte de nudgeUpPx
                 val baseline = maskTop - fm.ascent - nudgeUpPx
                 page.canvas.drawText(label, dest.exactCenterX(), baseline, paintText)
             }
